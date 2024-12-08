@@ -26,10 +26,11 @@ class LogEntry:
 
 
 class BaseMessage:
-    def __init__(self, msg_type: MessageType, data: dict):
+    def __init__(self, msg_type: MessageType, data: dict | None):
         self.type: MessageType = msg_type
-        self.term: int = data['term']
-        self.sender_id: int = data['sender_id']
+        if data is not None:
+            self.term: int = data['term']
+            self.sender_id: int = data['sender_id']
 
     def to_dict(self) -> dict:
         return {
@@ -74,7 +75,10 @@ class AppendEntries(BaseMessage):
         self.log_term: int = data['log_term']
         self.log_length: int = data['log_length']
         self.committed: int = data['committed']
-        self.entries: list[LogEntry] = [LogEntry(**entry) for entry in data.get('entries', [])]
+        self.entries: list[LogEntry] = [
+            entry if isinstance(entry, LogEntry) else LogEntry(**entry)
+            for entry in data.get('entries', [])
+        ]
         # print(f"AppendEntries::entries: {self.entries} with type {type(self.entries)}")
 
     def to_dict(self) -> dict:
@@ -105,17 +109,19 @@ class Acknowledgement(BaseMessage):
 
 class ClientRequest(BaseMessage):
     def __init__(self, data: dict):
-        super().__init__(MessageType.ClientRequest, data)
+        super().__init__(MessageType.ClientRequest, None)
         self.key: Any = data['key']
         self.value: Any | None = data.get('value')
         self.operation: str = data['operation']  # e.g., "get", "store", "delete"
+        self.address: str = data['address']  # address to send to
 
     def to_dict(self) -> dict:
         result = super().to_dict()
         result.update({
             'key': self.key,
             'value': self.value,
-            'operation': self.operation
+            'operation': self.operation,
+            'address': self.address
         })
         return result
 

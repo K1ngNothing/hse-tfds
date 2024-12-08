@@ -87,6 +87,7 @@ class RaftNode(threading.Thread):
         while not self._stopped.is_set():
             if self._paused.is_set():
                 time.sleep(1)
+                continue
 
             if self._role == Role.Leader:
                 self._leader_flow()
@@ -216,18 +217,7 @@ class RaftNode(threading.Thread):
                 last_heartbeat = time.time()
 
             # Check what we can commit
-            while self._committed < len(self._log):
-                id_to_commit = self._committed
-                acked = 1
-                for node_id in range(self.node_count):
-                    if node_id != self.id and self._acked_length[node_id] >= id_to_commit:
-                        acked += 1
-                if acked >= (self.node_count + 1) // 2:
-                    print(f"Leader committed entry {id_to_commit}!")
-                    self._commit_to_db(id_to_commit)
-                    self._committed += 1
-                else:
-                    break
+            self._try_to_commit_entries()
 
             # Check incoming messages
             message = self._get_message()
@@ -247,7 +237,8 @@ class RaftNode(threading.Thread):
                         self._acked_length[message.sender_id] = message.acked
                     else:
                         # we've sent too much => next time send less
-                        self._to_send[message.sender_id] -= 1
+                        if (self._to_send[message.sender_id] > 0):
+                            self._to_send[message.sender_id] -= 1
                         self._send_append_entries_request(message.sender_id)
 
                 if message.type == MessageType.RequestVote:
@@ -320,6 +311,25 @@ class RaftNode(threading.Thread):
                 self._commit_to_db(i)
             self._committed = leader_committed
 
+
+    def _try_to_commit_entries(self) -> None:
+        if self._role != Role.Leader:
+            return
+
+        while self._committed < len(self._log):
+            id_to_commit = self._committed
+            acked = 1
+            for node_id in range(self.node_count):
+                if node_id != self.id and self._acked_length[node_id] >= id_to_commit:
+                    acked += 1
+            if acked >= (self.node_count + 1) // 2:
+                print(f"Leader committed entry {id_to_commit}!")
+                self._commit_to_db(id_to_commit)
+                self._committed += 1
+            else:
+                break
+
+
     def _commit_to_db(self, entry_id: int):
         '''
         Apply entry to database
@@ -336,23 +346,37 @@ class RaftNode(threading.Thread):
     def _serve_client(self, message: ClientRequest) -> None:
         operation = message.operation.lower()
         key = message.key
+        reply_to_client: str | dict = "Empty response"
+
+        # Do request and prepare reply
         if operation == 'get':
             if key in self._data:
-                self._send_message({key: self._data[key]})
+                reply_to_client = {key: self._data[key]}
             else:
-                self._send_message({key: 'None'})
+                reply_to_client = {key: 'None'}
         elif operation == 'store':
             entry = LogEntry(self._term, key, message.value)
             self._log.append(entry)
-            self._send_message('Ok')
+            reply_to_client = 'Ok'
+        elif operation == 'delete':
+            entry = LogEntry(self._term, key, None)
+            self._log.append(entry)
+            reply_to_client = 'Ok'
+
+        # Send reply to client
+        self._reply_to_client(message.address, reply_to_client)
 
         if operation != 'get':
-            # We've added an entry to log => update self._to_send
+            # We've added an entry to log => update self._to_send and try to commit logs
+            # (but commit can only be done at least at the next leader's cycle)
             for node_id in range(self.node_count):
                 if node_id == self.id:
                     continue
                 if self._to_send[node_id] == len(self._log) - 1:
                     self._to_send[node_id] = len(self._log)
+
+                self._send_append_entries_request(node_id)
+
 
     def _send_client_to_leader(self) -> None:
         ''' I'm not a leader => tell client leader's address '''
@@ -462,6 +486,21 @@ class RaftNode(threading.Thread):
             target_address = get_address(target_id)
             with self._zmq_context.socket(zmq.PUSH) as socket:
                 socket.connect(f"tcp://{target_address}")
+                socket.setsockopt(zmq.SNDTIMEO, int(self._send_timeout * 1000))
+                if isinstance(msg, dict):
+                    socket.send_json(msg)
+                else:
+                    socket.send_string(msg)
+        except:
+            pass
+
+
+    def _reply_to_client(self, address: str, msg: str | dict) -> None:
+        # DEBUG
+        # print(f"Message to send: {msg}")
+        try:
+            with self._zmq_context.socket(zmq.PUSH) as socket:
+                socket.connect(f"tcp://{address}")
                 socket.setsockopt(zmq.SNDTIMEO, int(self._send_timeout * 1000))
                 if isinstance(msg, dict):
                     socket.send_json(msg)
