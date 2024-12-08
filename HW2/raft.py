@@ -1,14 +1,13 @@
 import time
-import json
 import random
 import threading
 import enum
+import zmq
 from queue import Queue, Empty
 from typing import cast
 
-from .communications import Listener, Talker
 from .protocol import ClientRequest, MessageType, BaseMessage, RequestVote, RequestVoteResponse, \
-    Acknowledgement, AppendEntries, CommitEntries, LogEntry
+    Acknowledgement, AppendEntries, LogEntry, build_message
 
 
 class Role(enum.Enum):
@@ -25,7 +24,11 @@ def get_address(id: int) -> str:
 
 
 class RaftNode(threading.Thread):
-    def __init__(self, id: int, node_count: int, role: Role = Role.Follower):
+    def __init__(self,
+                 id: int,
+                 node_count: int,
+                 role: Role = Role.Follower,
+                 bad_network_connections=set()):
         super().__init__(self)
         self.id = id
         self.node_count: int = node_count
@@ -49,16 +52,26 @@ class RaftNode(threading.Thread):
         self._to_send = [0 for _ in range(self.node_count)]
         self._acked_length = [0 for _ in range(self.node_count)]
 
-        # Outside manipulation
+        # Outside manipulation (used in tests)
         self._stopped = threading.Event()
+        self._bad_network_connections: set = bad_network_connections  # Which connections should always fail
 
         # Timing variables
         self._election_timeout = random.uniform(0.1, 0.2)
         self._heartbeat_delta = 0.01
+        self._send_timeout = 0.1
+
+        # Messaging
+        self._message_queue = Queue()  # Queue for incoming messages
+        self._zmq_context = zmq.Context()
+        self._receiver_socket = self._zmq_context.socket(zmq.PULL)
+        self._receiver_socket.bind(f"tcp://{get_address(self.id)}")
+        self._receiver_thread = threading.Thread(target=self._receive_messages, daemon=True)
+        self._receiver_thread.start()
 
     def stop(self):
         self._stopped.set()
-        print(f'Noe {self.id} is stopped')
+        print(f'Node {self.id} is stopped')
 
     def pause(self):
         self._role = Role.Disabled
@@ -86,7 +99,7 @@ class RaftNode(threading.Thread):
     def _follower_flow(self) -> None:
         last_heartbeat = time.time()
 
-        while not self._stopped.is_set() and self._role == Role.Candidate:
+        while not self._stopped.is_set() and self._role == Role.Follower:
             message = self._get_message()
 
             if message.type == MessageType.RequestVote:
@@ -100,8 +113,8 @@ class RaftNode(threading.Thread):
                 if message.term > self._term:
                     # We're old => update term
                     self._term = message.term
-                    self.voted_for = None
-                    self.leader_id = message.sender_id
+                    self._voted_for = None
+                    self._leader_id = message.sender_id
 
                 # Try to append entries
                 self._check_and_append_entries(message)
@@ -179,14 +192,14 @@ class RaftNode(threading.Thread):
 
     def _leader_flow(self):
         print(f'Now leader is : {self.id}')
-        self.leader_id = self.id
+        self._leader_id = self.id
 
         self._to_send = [len(self._log) for _ in range(self.node_count)]
-        self._acked = [0 for _ in range(self.node_count)]
+        self._acked_length = [0 for _ in range(self.node_count)]
 
         last_heartbeat = None
 
-        while not self._stopped.is_set and self._role == Role.Leader:
+        while not self._stopped.is_set() and self._role == Role.Leader:
             # Send heartbeat (at the same time update other nodes' logs)
             if last_heartbeat is None or time.time() - last_heartbeat > self._heartbeat_delta:
                 for node_id in range(self.node_count):
@@ -200,7 +213,7 @@ class RaftNode(threading.Thread):
                 id_to_commit = self._committed
                 acked = 1
                 for node_id in range(self.node_count):
-                    if node_id != self.id and self._acked[node_id] >= id_to_commit:
+                    if node_id != self.id and self._acked_length[node_id] >= id_to_commit:
                         acked += 1
                 if acked >= (self.node_count + 1) // 2:
                     print(f"Leader committed entry {id_to_commit}!")
@@ -221,7 +234,7 @@ class RaftNode(threading.Thread):
 
                 if message.ack:
                     self._to_send[message.sender_id] = message.ack
-                    self._acked[message.sender_id] = message.ack
+                    self._acked_length[message.sender_id] = message.ack
                 else:
                     # we've sent too much => next time send less
                     self._to_send[message.sender_id] -= 1
@@ -252,15 +265,15 @@ class RaftNode(threading.Thread):
         log_is_ok = (my_log_term < message.log_term or
                      (my_log_term == message.log_term and len(self._log) <= message.log_length))
         term_is_ok = (message.term > self._term or
-                      (message.term == self._term and self.voted_for in [None, message.sender_id]))
+                      (message.term == self._term and self._voted_for in [None, message.sender_id]))
 
         if log_is_ok and term_is_ok:
             self._term = message.term
             self._role = Role.Follower
             self._voted_for = message.sender_id
-            self._send_vote(True)
+            self._send_vote(message.sender_id, True)
         else:
-            self._send_vote(False)
+            self._send_vote(message.sender_id, False)
 
     def _check_and_append_entries(self, message: AppendEntries) -> None:
         '''
@@ -272,83 +285,11 @@ class RaftNode(threading.Thread):
                      (message.log_length == 0 or message.term == self._log[message.log_length - 1]))
         if message.term == self._term and log_is_ok:
             self._append_entries(message.log_length, message.committed, message.entries)
-            self._send_ack(len(message.log_length + len(message.entries)), True)
+            self._send_ack(message.sender_id, True, len(message.log_length + len(message.entries)))
             return True
 
-        self._send_ack(0, False)
+        self._send_ack(message.sender_id, False, 0)
         return False
-
-    # ----- Respond with message -----
-
-    def _send_vote(self, vote_granted: bool) -> None:
-        # TODO: implement
-        pass
-
-    def _send_ack(self, acked_len: int, acked: bool) -> None:
-        # TODO: implement
-        pass
-
-    def _broadcast_vote_request(self) -> None:
-        my_log_term = (self._log[-1].term if len(self._log) > 0 else 0)
-        # TODO: implement
-        pass
-
-    def _send_append_entries_request(self, node_id: int):
-        log_len = self._to_send[node_id]
-        entries = []
-        for i in range(log_len, len(self._log)):
-            entries.append(self._log(i))
-        
-        # TODO: implement
-        pass
-
-    # ----- Respond to client -----
-
-    def _serve_client(self, message: ClientRequest) -> None:
-        operation = message.operation.lower()
-        key = message.key
-        if operation == 'get':
-            if key in self._data:
-                self._send_message({key: self._data[key]})
-            else:
-                self._send_message({key: 'None'})
-        elif operation == 'store':
-            entry = LogEntry()
-            entry.key = key
-            entry.value = message.value
-            entry.term = self._term
-            self._log.append(entry)
-            self._send_message('Ok')
-
-        if operation != 'get':
-            # We've added an entry to log => update self._to_send
-            for node_id in range(self.node_count):
-                if node_id == self.id:
-                    continue
-                if self._to_send[node_id] == len(self._log) - 1:
-                    self._to_send[node_id] = len(self._log)
-
-    def _send_client_to_leader(self) -> None:
-        '''
-        I'm no a leader => tell client leader's address
-        '''
-        self._send_message(f'Ask leader: {self._leader_id}')
-
-    def _ask_client_to_wait(self) -> None:
-        '''
-        Election is in progress => try again later
-        '''
-        self._send_message(f'Election in progress. Ask again later')
-
-    # ----- Helpers -----
-
-    def _get_message() -> BaseMessage:
-        # TODO: implement
-        pass
-
-    def _send_message(msg) -> None:
-        # TODO: implement
-        pass
 
     def _append_entries(self, leader_log_len: int, leader_committed: int, entries: list[LogEntry]):
         # 1. Cut log if we're longer
@@ -363,7 +304,6 @@ class RaftNode(threading.Thread):
                 self._commit_to_db(i)
             self._committed = leader_committed
 
-
     def _commit_to_db(self, entry_id: int):
         '''
         Apply entry to database
@@ -374,3 +314,136 @@ class RaftNode(threading.Thread):
             del self._data[key]
         else:
             self._data[key] = value
+
+    # ----- Respond to client -----
+
+    def _serve_client(self, message: ClientRequest) -> None:
+        operation = message.operation.lower()
+        key = message.key
+        if operation == 'get':
+            if key in self._data:
+                self._send_message({key: self._data[key]})
+            else:
+                self._send_message({key: 'None'})
+        elif operation == 'store':
+            entry = LogEntry(self._term, key, message.value)
+            self._log.append(entry)
+            self._send_message('Ok')
+
+        if operation != 'get':
+            # We've added an entry to log => update self._to_send
+            for node_id in range(self.node_count):
+                if node_id == self.id:
+                    continue
+                if self._to_send[node_id] == len(self._log) - 1:
+                    self._to_send[node_id] = len(self._log)
+
+    def _send_client_to_leader(self) -> None:
+        ''' I'm not a leader => tell client leader's address '''
+        self._send_message(f'Ask leader: {self._leader_id}')
+
+    def _ask_client_to_wait(self) -> None:
+        ''' Election is in progress => ask client to try again later '''
+        self._send_message(f'Election in progress. Ask again later')
+
+
+    # ----- Respond with message -----
+
+    def _send_vote(self, target_id: int, vote_granted: bool) -> None:
+        response = RequestVoteResponse({
+            'term': self._term,
+            'sender_id': self.id,
+
+            'voted': vote_granted
+        })
+        self._send_message(target_id, response.to_dict())
+
+
+    def _send_ack(self, target_id: int, ack: bool, acked_len: int) -> None:
+        response = Acknowledgement({
+            'term': self._term,
+            'sender_id': self.id,
+
+            'ack': ack,
+            'acked': acked_len
+        })
+        self._send_message(target_id, response.to_dict())
+
+
+    def _broadcast_vote_request(self) -> None:
+        my_log_term = (self._log[-1].term if len(self._log) > 0 else 0)
+        request = RequestVote({
+            'term': self._term,
+            'sender_id': self.id,
+
+            'log_term': my_log_term,
+            'log_length': len(self._log)
+        })
+        request_dict = request.to_dict()
+
+        for node_id in range(self.node_count):
+            if node_id == self.id:
+                continue
+            self._send_message(node_id, request_dict)
+
+
+    def _send_append_entries_request(self, node_id: int):
+        log_len = self._to_send[node_id]
+        log_term: int = 0
+        if len(self._log) > 0 and log_len > 0:
+            log_term = self._log[log_len - 1].term
+        entries = []
+        for i in range(log_len, len(self._log)):
+            entries.append(self._log[i])
+
+        request = AppendEntries({
+            'term': self._term,
+            'sender_id': self.id,
+
+            'log_term': log_term,
+            'log_length': log_len,
+            'committed': self._committed,
+            'entries': entries
+        })
+        self._send_message(node_id, request.to_dict())
+
+    # ----- Messaging -----
+
+    def _receive_messages(self):
+        '''
+        Continuously receive messages and put them into the message queue.
+        '''
+        while not self._stopped.is_set():
+            try:
+                msg = self._receiver_socket.recv_json()
+                self._message_queue.put(msg)
+            except:
+                pass
+
+    def _get_message(self) -> BaseMessage:
+        '''
+        Retrieve the next message from the message queue.
+        Blocks until a message is available.
+        '''
+        while not self._stopped.is_set():
+            try:
+                msg = self._message_queue.get(timeout=0.1)
+                return build_message(msg)
+            except Empty:
+                continue
+
+    def _send_message(self, target_id: int, msg: str | dict) -> None:
+        '''
+        Send a message to a specific node.
+        '''
+        try:
+            target_address = get_address(target_id)
+            with self._zmq_context.socket(zmq.PUSH) as socket:
+                socket.connect(f"tcp://{target_address}")
+                socket.setsockopt(zmq.SNDTIMEO, int(self._send_timeout * 1000))
+                if isinstance(msg, dict):
+                    socket.send_json(msg)
+                else:
+                    socket.send_string(msg)
+        except:
+            pass
