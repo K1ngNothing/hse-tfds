@@ -75,6 +75,7 @@ class AppendEntries(BaseMessage):
         self.log_length: int = data['log_length']
         self.committed: int = data['committed']
         self.entries: list[LogEntry] = [LogEntry(**entry) for entry in data.get('entries', [])]
+        # print(f"AppendEntries::entries: {self.entries} with type {type(self.entries)}")
 
     def to_dict(self) -> dict:
         result = super().to_dict()

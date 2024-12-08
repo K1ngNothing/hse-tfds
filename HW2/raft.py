@@ -6,7 +6,7 @@ import zmq
 from queue import Queue, Empty
 from typing import cast
 
-from .protocol import ClientRequest, MessageType, BaseMessage, RequestVote, RequestVoteResponse, \
+from protocol import ClientRequest, MessageType, BaseMessage, RequestVote, RequestVoteResponse, \
     Acknowledgement, AppendEntries, LogEntry, build_message
 
 
@@ -14,7 +14,6 @@ class Role(enum.Enum):
     Leader = 0,
     Follower = 1,
     Candidate = 2,
-    Disabled = 3,
 
 
 def get_address(id: int) -> str:
@@ -29,7 +28,7 @@ class RaftNode(threading.Thread):
                  node_count: int,
                  role: Role = Role.Follower,
                  bad_network_connections=set()):
-        super().__init__(self)
+        super().__init__()
         self.id = id
         self.node_count: int = node_count
         self._data: dict[any, any] = {}
@@ -54,12 +53,14 @@ class RaftNode(threading.Thread):
 
         # Outside manipulation (used in tests)
         self._stopped = threading.Event()
+        self._paused = threading.Event()
         self._bad_network_connections: set = bad_network_connections  # Which connections should always fail
 
         # Timing variables
         self._election_timeout = random.uniform(0.1, 0.2)
         self._heartbeat_delta = 0.01
-        self._send_timeout = 0.1
+        self._send_timeout = 0.005
+        self._receive_timeout = 0.005
 
         # Messaging
         self._message_queue = Queue()  # Queue for incoming messages
@@ -71,59 +72,61 @@ class RaftNode(threading.Thread):
 
     def stop(self):
         self._stopped.set()
-        print(f'Node {self.id} is stopped')
+        self._paused.set()
+        # print(f'Node {self.id} is stopped')
 
     def pause(self):
-        self._role = Role.Disabled
-        print(f'Node {self.id} is paused')
+        self._paused.set()
+        # print(f'Node {self.id} is paused')
 
     def unpause(self):
-        if self._role == Role.Disabled:
-            self._role = Role.Follower
-        print(f'Node {self.id} is unpaused')
+        self._paused.clear()
+        # print(f'Node {self.id} is unpaused')
 
     def run(self):
         while not self._stopped.is_set():
+            if self._paused.is_set():
+                time.sleep(1)
+
             if self._role == Role.Leader:
                 self._leader_flow()
             elif self._role == Role.Follower:
                 self._follower_flow()
             elif self._role == Role.Candidate:
                 self._candidate_flow()
-            else:
-                # Node is disabled. Just chill a bit.
-                time.sleep(1)
 
     # ----- Flows for each role -----
 
     def _follower_flow(self) -> None:
+        # print(f"Node {self.id} is follower")
         last_heartbeat = time.time()
 
-        while not self._stopped.is_set() and self._role == Role.Follower:
+        while not self._paused.is_set() and self._role == Role.Follower:
             message = self._get_message()
 
-            if message.type == MessageType.RequestVote:
-                # Try to vote for candidate
-                self._check_and_vote(message)
+            if message is not None:
+                if message.type == MessageType.RequestVote:
+                    # Try to vote for candidate
+                    self._check_and_vote(message)
 
-                # Vote in progress => we should not promote to Candidate
-                last_heartbeat = time.time()
+                    # Vote in progress => we should not promote to Candidate
+                    last_heartbeat = time.time()
 
-            elif message.type == MessageType.AppendEntries:
-                if message.term > self._term:
-                    # We're old => update term
-                    self._term = message.term
-                    self._voted_for = None
-                    self._leader_id = message.sender_id
+                elif message.type == MessageType.AppendEntries:
+                    if message.term > self._term:
+                        # We're old => update term
+                        self._term = message.term
+                        self._voted_for = None
+                        self._leader_id = message.sender_id
 
-                # Try to append entries
-                self._check_and_append_entries(message)
+                    # Try to append entries
+                    self._check_and_append_entries(message)
 
-                # We've got a message from leader => update timer
-                last_heartbeat = time.time()
+                    # We've got a message from leader => update timer
+                    last_heartbeat = time.time()
 
-            elif message.type == MessageType.ClientRequest:
-                self._send_client_to_leader()
+                elif message.type == MessageType.ClientRequest:
+                    self._send_client_to_leader()
 
             # If you haven't heard a heartbeat in a while, promote yourself to a candidate
             if time.time() - last_heartbeat > self._election_timeout:
@@ -131,54 +134,58 @@ class RaftNode(threading.Thread):
                 return
 
     def _candidate_flow(self):
+        print(f'Node {self.id} is candidate')
+
         self._term += 1
         self._voted_for = self.id
-        self._votes_received = set(self.id)
+        self._votes_received = set()
+        self._votes_received.add(self.id)
         self._broadcast_vote_request()
 
         election_started = time.time()
 
-        while not self._stopped.is_set() and self._role == Role.Candidate:
+        while not self._paused.is_set() and self._role == Role.Candidate:
             message = self._get_message()
 
-            if message.type == MessageType.RequestVoteResponse:
-                message = cast(RequestVoteResponse, message)
+            if message is not None:
+                if message.type == MessageType.RequestVoteResponse:
+                    message = cast(RequestVoteResponse, message)
 
-                if message.term > self._term:
-                    # Someone has a higher term => become follower
-                    self._term = message.term
-                    self._role = Role.Follower
-                    self._voted_for = None
-                    break
+                    if message.term > self._term:
+                        # Someone has a higher term => become follower
+                        self._term = message.term
+                        self._role = Role.Follower
+                        self._voted_for = None
+                        break
 
-                if message.voted:
-                    self._votes_received.add(message.sender_id)
+                    if message.voted:
+                        self._votes_received.add(message.sender_id)
 
-                # If you have a majority, promote yourself
-                if len(self._votes_received) >= (self.node_count + 1) // 2:
-                    self._role = Role.Leader
-                    break
+                    # If you have a majority, promote yourself
+                    if len(self._votes_received) >= (self.node_count + 1) // 2:
+                        self._role = Role.Leader
+                        break
 
-            if message.type == MessageType.RequestVote:
-                if message.term > self._term:
-                    # Higher term vote is going on => become follower
-                    self._term = message.term
-                    self._role = Role.Follower
-                    self._voted_for = None
+                if message.type == MessageType.RequestVote:
+                    if message.term > self._term:
+                        # Higher term vote is going on => become follower
+                        self._term = message.term
+                        self._role = Role.Follower
+                        self._voted_for = None
 
-                self._check_and_vote(message)
+                    self._check_and_vote(message)
 
-            elif message.type == MessageType.AppendEntries:
-                if message.term >= self._term:
-                    # Leader was already chosen on this term => become follower
-                    self._term = message.term
-                    self._role = Role.Follower
-                    self._voted_for = None
+                elif message.type == MessageType.AppendEntries:
+                    if message.term >= self._term:
+                        # Leader was already chosen on this term => become follower
+                        self._term = message.term
+                        self._role = Role.Follower
+                        self._voted_for = None
 
-                self._check_and_append_entries(message)
+                    self._check_and_append_entries(message)
 
-            elif message.type == MessageType.ClientRequest:
-                self._ask_client_to_wait()
+                elif message.type == MessageType.ClientRequest:
+                    self._ask_client_to_wait()
 
             # Check whether we're still a candidate
             if self._role != Role.Candidate:
@@ -191,7 +198,7 @@ class RaftNode(threading.Thread):
         return
 
     def _leader_flow(self):
-        print(f'Now leader is : {self.id}')
+        print(f'Node {self.id} is leader')
         self._leader_id = self.id
 
         self._to_send = [len(self._log) for _ in range(self.node_count)]
@@ -199,7 +206,7 @@ class RaftNode(threading.Thread):
 
         last_heartbeat = None
 
-        while not self._stopped.is_set() and self._role == Role.Leader:
+        while not self._paused.is_set() and self._role == Role.Leader:
             # Send heartbeat (at the same time update other nodes' logs)
             if last_heartbeat is None or time.time() - last_heartbeat > self._heartbeat_delta:
                 for node_id in range(self.node_count):
@@ -224,33 +231,37 @@ class RaftNode(threading.Thread):
 
             # Check incoming messages
             message = self._get_message()
-            if message.type == MessageType.Acknowledgement:
-                message = cast(Acknowledgement, message)
-                if message.term > self._term:
-                    # We're too old => become follower
-                    self._term = message.term
-                    self._role = Role.Follower
-                    break
 
-                if message.ack:
-                    self._to_send[message.sender_id] = message.ack
-                    self._acked_length[message.sender_id] = message.ack
-                else:
-                    # we've sent too much => next time send less
-                    self._to_send[message.sender_id] -= 1
-                    self._send_append_entries_request(message.sender_id)
+            if message is not None:
+                if message.type == MessageType.Acknowledgement:
+                    message = cast(Acknowledgement, message)
+                    if message.term > self._term:
+                        # We're too old => become follower
+                        self._term = message.term
+                        self._role = Role.Follower
+                        print(f"Node {self.id} is demoted to follower")
+                        break
 
-            if message.type == MessageType.RequestVote:
-                if message.term > self._term:
-                    # Higher term vote is going on => become follower
-                    self._term = message.term
-                    self._role = Role.Follower
-                    self._voted_for = None
+                    if message.ack:
+                        self._to_send[message.sender_id] = message.acked
+                        self._acked_length[message.sender_id] = message.acked
+                    else:
+                        # we've sent too much => next time send less
+                        self._to_send[message.sender_id] -= 1
+                        self._send_append_entries_request(message.sender_id)
 
-                self._check_and_vote(message)
+                if message.type == MessageType.RequestVote:
+                    if message.term > self._term:
+                        # Higher term vote is going on => become follower
+                        self._term = message.term
+                        self._role = Role.Follower
+                        self._voted_for = None
+                        print(f"Node {self.id} is demoted to follower")
 
-            elif message.type == MessageType.ClientRequest:
-                self._serve_client(message)
+                    self._check_and_vote(message)
+
+                elif message.type == MessageType.ClientRequest:
+                    self._serve_client(message)
 
         return
 
@@ -282,10 +293,15 @@ class RaftNode(threading.Thread):
         '''
         # My log should be longer and we should have a common prefix
         log_is_ok = (len(self._log) >= message.log_length and
-                     (message.log_length == 0 or message.term == self._log[message.log_length - 1]))
-        if message.term == self._term and log_is_ok:
+                     (message.log_length == 0 or message.log_term == self._log[message.log_length - 1]))
+        # DEBUG
+        # if not log_is_ok:
+        #     print(f"Me: log: {self._log}, term: {self._term}\n"
+        #           f"Message: log_length: {message.log_length}, log_term: {message.log_term}")
+        #     exit(0)
+        if message.term >= self._term and log_is_ok:
             self._append_entries(message.log_length, message.committed, message.entries)
-            self._send_ack(message.sender_id, True, len(message.log_length + len(message.entries)))
+            self._send_ack(message.sender_id, True, message.log_length + len(message.entries))
             return True
 
         self._send_ack(message.sender_id, False, 0)
@@ -423,19 +439,25 @@ class RaftNode(threading.Thread):
     def _get_message(self) -> BaseMessage:
         '''
         Retrieve the next message from the message queue.
-        Blocks until a message is available.
+        If no message is found in timeout, return None
         '''
         while not self._stopped.is_set():
             try:
-                msg = self._message_queue.get(timeout=0.1)
+                msg = self._message_queue.get(timeout=self._receive_timeout)
+                # DEBUG
+                # if msg['type'] == "AppendEntries":
+                #     print(f"Got message: {msg}")
                 return build_message(msg)
             except Empty:
-                continue
+                return None
 
     def _send_message(self, target_id: int, msg: str | dict) -> None:
         '''
         Send a message to a specific node.
         '''
+        # DEBUG
+        # if msg['type'] == "AppendEntries":
+        #     print(f"Message to send: {msg}")
         try:
             target_address = get_address(target_id)
             with self._zmq_context.socket(zmq.PUSH) as socket:
