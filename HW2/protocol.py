@@ -113,7 +113,7 @@ class ClientRequest(BaseMessage):
         super().__init__(MessageType.ClientRequest, None)
         self.key: Any = data['key']
         self.value: Any | None = data.get('value')
-        self.operation: str = data['operation']  # e.g., "get", "store", "delete"
+        self.operation: str = data['operation']  # e.g., "get", "store", "delete", "inc"
         self.address: str = data['address']  # address to send to
 
     def to_dict(self) -> dict:

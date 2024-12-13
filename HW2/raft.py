@@ -14,6 +14,7 @@ class Role(enum.Enum):
     Leader = 0,
     Follower = 1,
     Candidate = 2,
+    Test = 3,  # used in tests
 
 
 def get_address(id: int) -> str:
@@ -48,7 +49,7 @@ class RaftNode(threading.Thread):
         self._votes_received: set[int] = set()
 
         # Other nodes state
-        self._to_send = [0 for _ in range(self.node_count)]
+        self._common_prefix = [0 for _ in range(self.node_count)]
         self._acked_length = [0 for _ in range(self.node_count)]
 
         # Outside manipulation (used in tests)
@@ -79,16 +80,18 @@ class RaftNode(threading.Thread):
 
     def pause(self):
         self._paused.set()
-        # print(f'Node {self.id} is paused')
+        print(f'Node {self.id} is paused')
 
     def unpause(self):
         self._paused.clear()
-        # print(f'Node {self.id} is unpaused')
+        # Clear message queue. This will drop all messages received while paused.
+        self._message_queue.queue.clear()
+        print(f'Node {self.id} is unpaused')
 
     def run(self):
         while not self._stopped.is_set():
             if self._paused.is_set():
-                time.sleep(1)
+                time.sleep(self._heartbeat_delta)
                 continue
 
             if self._role == Role.Leader:
@@ -97,11 +100,20 @@ class RaftNode(threading.Thread):
                 self._follower_flow()
             elif self._role == Role.Candidate:
                 self._candidate_flow()
+            elif self._role == Role.Test:
+                # Just serve client requests
+                message = self._get_message()
+                if message is not None and message.type == MessageType.ClientRequest:
+                    self._serve_client(message)
 
     # ----- Flows for each role -----
 
     def _follower_flow(self) -> None:
-        # print(f"Node {self.id} is follower")
+        if self._role != Role.Follower:
+            return
+
+        print(f"Node {self.id} is follower on term {self._term}")
+
         last_heartbeat = time.time()
 
         while not self._paused.is_set() and self._role == Role.Follower:
@@ -109,11 +121,12 @@ class RaftNode(threading.Thread):
 
             if message is not None:
                 if message.type == MessageType.RequestVote:
+                    if message.term > self._term:
+                        # Vote in progress => we should not promote to Candidate
+                        last_heartbeat = time.time()
+
                     # Try to vote for candidate
                     self._check_and_vote(message)
-
-                    # Vote in progress => we should not promote to Candidate
-                    last_heartbeat = time.time()
 
                 elif message.type == MessageType.AppendEntries:
                     if message.term > self._term:
@@ -123,15 +136,15 @@ class RaftNode(threading.Thread):
 
                     if message.term == self._term:
                         self._leader_id = message.sender_id
+                        # We've got a message from leader => update timer
+                        last_heartbeat = time.time()
 
                     # Try to append entries
                     self._check_and_append_entries(message)
 
-                    # We've got a message from leader => update timer
-                    last_heartbeat = time.time()
-
                 elif message.type == MessageType.ClientRequest:
-                    self._send_client_to_leader()
+                    message = cast(ClientRequest, message)
+                    self._send_client_to_leader(message.address)
 
             # If you haven't heard a heartbeat in a while, promote yourself to a candidate
             if time.time() - last_heartbeat > self._election_timeout:
@@ -139,13 +152,16 @@ class RaftNode(threading.Thread):
                 return
 
     def _candidate_flow(self):
-        print(f'Node {self.id} is candidate')
+        if self._role != Role.Candidate:
+            return
 
         self._term += 1
         self._voted_for = self.id
         self._votes_received = set()
         self._votes_received.add(self.id)
         self._broadcast_vote_request()
+
+        print(f'Node {self.id} is candidate on term {self._term}')
 
         election_started = time.time()
 
@@ -158,9 +174,7 @@ class RaftNode(threading.Thread):
 
                     if message.term > self._term:
                         # Someone has a higher term => become follower
-                        self._term = message.term
-                        self._role = Role.Follower
-                        self._voted_for = None
+                        self._demote_to_follower(message.term)
                         break
 
                     if message.voted:
@@ -174,23 +188,20 @@ class RaftNode(threading.Thread):
                 if message.type == MessageType.RequestVote:
                     if message.term > self._term:
                         # Higher term vote is going on => become follower
-                        self._term = message.term
-                        self._role = Role.Follower
-                        self._voted_for = None
+                        self._demote_to_follower(message.term)
 
                     self._check_and_vote(message)
 
                 elif message.type == MessageType.AppendEntries:
                     if message.term >= self._term:
                         # Leader was already chosen on this term => become follower
-                        self._term = message.term
-                        self._role = Role.Follower
-                        self._voted_for = None
+                        self._demote_to_follower(message.term)
 
                     self._check_and_append_entries(message)
 
                 elif message.type == MessageType.ClientRequest:
-                    self._ask_client_to_wait()
+                    message = cast(ClientRequest, message)
+                    self._ask_client_to_wait(message.address)
 
             # Check whether we're still a candidate
             if self._role != Role.Candidate:
@@ -203,11 +214,14 @@ class RaftNode(threading.Thread):
         return
 
     def _leader_flow(self):
-        print(f'Node {self.id} is leader')
-        self._leader_id = self.id
+        if self._role != Role.Leader:
+            return
 
-        self._to_send = [len(self._log) for _ in range(self.node_count)]
+        self._leader_id = self.id
+        self._common_prefix = [len(self._log) for _ in range(self.node_count)]
         self._acked_length = [0 for _ in range(self.node_count)]
+
+        print(f'!!! Node {self.id} is leader on term {self._term}')
 
         last_heartbeat = None
 
@@ -227,31 +241,24 @@ class RaftNode(threading.Thread):
             message = self._get_message()
 
             if message is not None:
-                if message.type == MessageType.Acknowledgement:
+                if message.type == MessageType.Acknowledgement and message.term >= self._term: # i.e. this ACK is relevant
                     message = cast(Acknowledgement, message)
                     if message.term > self._term:
                         # We're too old => become follower
-                        self._term = message.term
-                        self._role = Role.Follower
-                        print(f"Node {self.id} is demoted to follower")
+                        self._demote_to_follower(message.term)
                         break
 
                     if message.ack:
-                        self._to_send[message.sender_id] = message.acked
+                        self._common_prefix[message.sender_id] = message.acked
                         self._acked_length[message.sender_id] = message.acked
-                    else:
+                    elif message.acked == self._common_prefix[message.sender_id]:  # i.e. it's up-to-date NACK
                         # we've sent too much => next time send less
-                        if (self._to_send[message.sender_id] > 0):
-                            self._to_send[message.sender_id] -= 1
-                        self._send_append_entries_request(message.sender_id)
+                        self._common_prefix[message.sender_id] -= 1
 
                 if message.type == MessageType.RequestVote:
                     if message.term > self._term:
                         # Higher term vote is going on => become follower
-                        self._term = message.term
-                        self._role = Role.Follower
-                        self._voted_for = None
-                        print(f"Node {self.id} is demoted to follower")
+                        self._demote_to_follower(message.term)
 
                     self._check_and_vote(message)
 
@@ -286,18 +293,20 @@ class RaftNode(threading.Thread):
         Check whether append entries request is newer.
         If so, update our log.
         '''
+        if message.term >= self._term:
+            self._demote_to_follower(message.term)
+            self._leader_id = message.sender_id
+
         # My log should be longer and we should have a common prefix
         log_is_ok = (len(self._log) >= message.log_length and
-                     (message.log_length == 0 or message.log_term == self._log[message.log_length - 1]))
-        if message.term >= self._term and log_is_ok:
+                     (message.log_length == 0 or message.log_term == self._log[message.log_length - 1].term))
+        if message.term == self._term and log_is_ok:
             self._append_entries(message.log_length,
                                  message.committed, message.entries)
             self._send_ack(message.sender_id, True,
                            message.log_length + len(message.entries))
-            return True
-
-        self._send_ack(message.sender_id, False, 0)
-        return False
+        else:
+            self._send_ack(message.sender_id, False, message.log_length)
 
     def _append_entries(self, leader_log_len: int, leader_committed: int, entries: list[LogEntry]):
         # 1. Cut log if we're longer
@@ -306,7 +315,7 @@ class RaftNode(threading.Thread):
         # 2. Append entries
         for entry in entries:
             self._log.append(entry)
-        # 3. Commit if leader already committed
+        # 3. Commit what leader already committed
         if leader_committed > self._committed:
             for i in range(self._committed, leader_committed):
                 self._commit_to_db(i)
@@ -323,7 +332,6 @@ class RaftNode(threading.Thread):
                 if node_id != self.id and self._acked_length[node_id] >= id_to_commit:
                     acked += 1
             if acked >= (self.node_count + 1) // 2:
-                print(f"Leader committed entry {id_to_commit}!")
                 self._commit_to_db(id_to_commit)
                 self._committed += 1
             else:
@@ -340,12 +348,21 @@ class RaftNode(threading.Thread):
         else:
             self._data[key] = value
 
+    def _demote_to_follower(self, term: int):
+        if self._term < term:
+            print(f"Node {self.id} was demoted to follower on term {term}")
+
+        self._term = term
+        self._role = Role.Follower
+        self._voted_for = None
+
     # ----- Respond to client -----
 
     def _serve_client(self, message: ClientRequest) -> None:
         operation = message.operation.lower()
         key = message.key
         reply_to_client: str | dict = "Empty response"
+        init_log_len = len(self._log)
 
         # Do request and prepare reply
         if operation == 'get':
@@ -361,28 +378,38 @@ class RaftNode(threading.Thread):
             entry = LogEntry(self._term, key, None)
             self._log.append(entry)
             reply_to_client = 'Ok'
+        elif operation == 'inc':
+            if key not in self._data:
+                reply_to_client = 'Key not found :('
+            elif type(self._data[key]) != int or type(message.value) != int:
+                reply_to_client = "Stored or passed value isn't int"
+            else:
+                new_value = self._data[key] + int(message.value)
+                entry = LogEntry(self._term, key, new_value)
+                self._log.append(entry)
+                reply_to_client = 'Ok'
+        else:
+            reply_to_client = 'Only support operations: get, store, delete, inc'
 
         # Send reply to client
         self._reply_to_client(message.address, reply_to_client)
 
-        if operation != 'get':
-            # We've added an entry to log => update self._to_send and try to commit logs
+        if len(self._log) > init_log_len:
+            # We've added an entry to log => send append entries request to all nodes
             # (but commit can only be done at least at the next leader's cycle)
             for node_id in range(self.node_count):
                 if node_id == self.id:
                     continue
-                if self._to_send[node_id] == len(self._log) - 1:
-                    self._to_send[node_id] = len(self._log)
 
                 self._send_append_entries_request(node_id)
 
-    def _send_client_to_leader(self) -> None:
+    def _send_client_to_leader(self, client_addr: str) -> None:
         ''' I'm not a leader => tell client leader's address '''
-        self._send_message(f'Ask leader: {self._leader_id}')
+        self._reply_to_client(client_addr, f'Ask leader: {self._leader_id}')
 
-    def _ask_client_to_wait(self) -> None:
+    def _ask_client_to_wait(self, client_addr: str) -> None:
         ''' Election is in progress => ask client to try again later '''
-        self._send_message(f'Election in progress. Ask again later')
+        self._reply_to_client(client_addr, f'Election in progress. Ask again later.')
 
     # ----- Respond with message -----
 
@@ -422,12 +449,12 @@ class RaftNode(threading.Thread):
             self._send_message(node_id, request_dict)
 
     def _send_append_entries_request(self, node_id: int):
-        log_len = self._to_send[node_id]
+        log_length = self._common_prefix[node_id]
         log_term: int = 0
-        if len(self._log) > 0 and log_len > 0:
-            log_term = self._log[log_len - 1].term
+        if len(self._log) > 0 and log_length > 0:
+            log_term = self._log[log_length - 1].term
         entries = []
-        for i in range(log_len, len(self._log)):
+        for i in range(log_length, len(self._log)):
             entries.append(self._log[i])
 
         request = AppendEntries({
@@ -435,7 +462,7 @@ class RaftNode(threading.Thread):
             'sender_id': self.id,
 
             'log_term': log_term,
-            'log_length': log_len,
+            'log_length': log_length,
             'committed': self._committed,
             'entries': entries
         })
@@ -451,6 +478,7 @@ class RaftNode(threading.Thread):
             try:
                 msg = self._receiver_socket.recv_json()
                 self._message_queue.put(msg)
+
             except:
                 pass
 
