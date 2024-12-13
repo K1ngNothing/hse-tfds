@@ -98,12 +98,14 @@ class Acknowledgement(BaseMessage):
         super().__init__(MessageType.Acknowledgement, data)
         self.ack: bool = data['ack']
         self.acked: int = data['acked']
+        self.committed: int = data['committed']
 
     def to_dict(self) -> dict:
         result = super().to_dict()
         result.update({
             'ack': self.ack,
-            'acked': self.acked
+            'acked': self.acked,
+            'committed': self.committed
         })
         return result
 

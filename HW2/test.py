@@ -6,6 +6,9 @@ from raft import RaftNode, Role, get_address
 from protocol import ClientRequest, LogEntry
 
 
+# ----- Utils -----
+
+
 def find_leader(nodes: list[RaftNode], exclude: list = []) -> int | None:
     leader = None
     for (i, node) in enumerate(nodes):
@@ -49,9 +52,13 @@ def request_node(node_id: int, request_dict: dict) -> dict | str:
         zmq_context.term()
 
 
+# ----- Tests -----
+
+
 def test_leader_election():
     node_count = 5
-    nodes = [RaftNode(id=i, node_count=node_count) for i in range(node_count)]
+    nodes = [RaftNode(id=i, node_count=node_count, simple_client_serving=True)
+             for i in range(node_count)]
     for node in nodes:
         node.start()
     time.sleep(1)
@@ -89,7 +96,8 @@ def test_leader_election():
 
 def test_multiple_candidates():
     node_count = 5
-    nodes = [RaftNode(id=i, node_count=node_count) for i in range(node_count)]
+    nodes = [RaftNode(id=i, node_count=node_count, simple_client_serving=True)
+             for i in range(node_count)]
     nodes[0]._role = Role.Candidate
     nodes[1]._role = Role.Candidate
     nodes[2]._role = Role.Candidate
@@ -111,7 +119,8 @@ def test_multiple_candidates():
 
 def test_replication():
     node_count = 5
-    nodes = [RaftNode(id=i, node_count=node_count) for i in range(node_count)]
+    nodes = [RaftNode(id=i, node_count=node_count, simple_client_serving=True)
+             for i in range(node_count)]
     nodes[0]._role = Role.Leader  # For simplicity sake we set first leader
     for node in nodes:
         node.start()
@@ -174,9 +183,10 @@ def test_replication():
             node.stop()
 
 
-def interactive_mode():
+def interactive_mode(simple_client_serving: bool):
     node_count = 5
-    nodes = [RaftNode(id=i, node_count=node_count) for i in range(node_count)]
+    nodes = [RaftNode(id=i, node_count=node_count, simple_client_serving=simple_client_serving)
+             for i in range(node_count)]
     for node in nodes:
         node.start()
     time.sleep(1)
@@ -219,4 +229,6 @@ if __name__ == "__main__":
     # test_leader_election()
     # test_multiple_candidates()
     # test_replication()
-    interactive_mode()
+
+    # interactive_mode(simple_client_serving=True)
+    interactive_mode(simple_client_serving=False)

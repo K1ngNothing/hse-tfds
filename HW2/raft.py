@@ -14,7 +14,6 @@ class Role(enum.Enum):
     Leader = 0,
     Follower = 1,
     Candidate = 2,
-    Test = 3,  # used in tests
 
 
 def get_address(id: int) -> str:
@@ -28,7 +27,7 @@ class RaftNode(threading.Thread):
                  id: int,
                  node_count: int,
                  role: Role = Role.Follower,
-                 bad_network_connections=set()):
+                 simple_client_serving: bool = False):
         super().__init__()
         self.id = id
         self.node_count: int = node_count
@@ -51,12 +50,13 @@ class RaftNode(threading.Thread):
         # Other nodes state
         self._common_prefix = [0 for _ in range(self.node_count)]
         self._acked_length = [0 for _ in range(self.node_count)]
+        self._committed_length = [0 for _ in range(self.node_count)]
 
         # Outside manipulation (used in tests)
         self._stopped = threading.Event()
         self._paused = threading.Event()
-        # Which connections should always fail
-        self._bad_network_connections: set = bad_network_connections
+        # Whether GET requests should be served only by leader
+        self._simple_client_serving = simple_client_serving
 
         # Timing variables
         self._election_timeout = random.uniform(0.1, 0.2)
@@ -100,11 +100,6 @@ class RaftNode(threading.Thread):
                 self._follower_flow()
             elif self._role == Role.Candidate:
                 self._candidate_flow()
-            elif self._role == Role.Test:
-                # Just serve client requests
-                message = self._get_message()
-                if message is not None and message.type == MessageType.ClientRequest:
-                    self._serve_client(message)
 
     # ----- Flows for each role -----
 
@@ -144,7 +139,10 @@ class RaftNode(threading.Thread):
 
                 elif message.type == MessageType.ClientRequest:
                     message = cast(ClientRequest, message)
-                    self._send_client_to_leader(message.address)
+                    if self._simple_client_serving or message.operation.lower() != 'get':
+                        self._send_client_to_leader(message.address)
+                    else:
+                        self._serve_client(message)
 
             # If you haven't heard a heartbeat in a while, promote yourself to a candidate
             if time.time() - last_heartbeat > self._election_timeout:
@@ -220,6 +218,7 @@ class RaftNode(threading.Thread):
         self._leader_id = self.id
         self._common_prefix = [len(self._log) for _ in range(self.node_count)]
         self._acked_length = [0 for _ in range(self.node_count)]
+        self._committed_length = [0 for _ in range(self.node_count)]
 
         print(f'!!! Node {self.id} is leader on term {self._term}')
 
@@ -251,6 +250,7 @@ class RaftNode(threading.Thread):
                     if message.ack:
                         self._common_prefix[message.sender_id] = message.acked
                         self._acked_length[message.sender_id] = message.acked
+                        self._committed_length[message.sender_id] = message.committed
                     elif message.acked == self._common_prefix[message.sender_id]:  # i.e. it's up-to-date NACK
                         # we've sent too much => next time send less
                         self._common_prefix[message.sender_id] -= 1
@@ -366,6 +366,13 @@ class RaftNode(threading.Thread):
 
         # Do request and prepare reply
         if operation == 'get':
+            if self._role == Role.Leader and not self._simple_client_serving:
+                # Try to retranslate request to replica
+                replica_id = self._find_replica_for_client(message)
+                if replica_id is not None:
+                    self._send_client_to_replica(message.address, replica_id)
+                    return
+
             if key in self._data:
                 reply_to_client = {key: self._data[key]}
             else:
@@ -407,9 +414,31 @@ class RaftNode(threading.Thread):
         ''' I'm not a leader => tell client leader's address '''
         self._reply_to_client(client_addr, f'Ask leader: {self._leader_id}')
 
+    def _send_client_to_replica(self, client_addr: str, replica_id: int) -> None:
+        self._reply_to_client(client_addr, f'Ask replica: {replica_id}')
+
     def _ask_client_to_wait(self, client_addr: str) -> None:
         ''' Election is in progress => ask client to try again later '''
         self._reply_to_client(client_addr, f'Election in progress. Ask again later.')
+
+    def _find_replica_for_client(self, message: ClientRequest) -> int | None:
+        # 1. Find last LogEntry with relevant key
+        entry_id = -1
+        for i in range(len(self._log) - 1, -1, -1):
+            if self._log[i].key == message.key:
+                entry_id = i
+                break
+
+        # 2. Find replicas that committed at least entry_id + 1
+        good_replicas = []
+        for node_id in range(self.node_count):
+            if self._committed_length[node_id] >= entry_id + 1:
+                good_replicas.append(node_id)
+
+        # 3. Pick a random replica that suffices
+        if len(good_replicas) > 0:
+            return random.choice(good_replicas)
+        return None
 
     # ----- Respond with message -----
 
@@ -428,7 +457,8 @@ class RaftNode(threading.Thread):
             'sender_id': self.id,
 
             'ack': ack,
-            'acked': acked_len
+            'acked': acked_len,
+            'committed': self._committed
         })
         self._send_message(target_id, response.to_dict())
 
