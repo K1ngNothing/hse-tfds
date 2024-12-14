@@ -179,7 +179,7 @@ class RaftNode(threading.Thread):
                         self._votes_received.add(message.sender_id)
 
                     # If you have a majority, promote yourself
-                    if len(self._votes_received) >= (self.node_count + 1) // 2:
+                    if self._quorum(len(self._votes_received)):
                         self._role = Role.Leader
                         break
 
@@ -331,7 +331,7 @@ class RaftNode(threading.Thread):
             for node_id in range(self.node_count):
                 if node_id != self.id and self._acked_length[node_id] >= id_to_commit:
                     acked += 1
-            if acked >= (self.node_count + 1) // 2:
+            if self._quorum(acked):
                 self._commit_to_db(id_to_commit)
                 self._committed += 1
             else:
@@ -551,3 +551,6 @@ class RaftNode(threading.Thread):
                     socket.send_string(msg)
         except:
             pass
+
+    def _quorum(self, x: int) -> bool:
+        return x >= (self.node_count + 1) // 2  + (self.node_count + 1) % 2
