@@ -14,7 +14,7 @@ def test_random_delays():
 
     # Do some operations with different nodes.
     random.seed(42)
-    request_count = 10
+    request_count = 20
     keys = ['a', 'b', 'c']
     for _ in range(request_count):
         node_id = random.choice(range(node_count))
@@ -23,7 +23,7 @@ def test_random_delays():
         request_patch_1(nodes[node_id], key, value)
 
     # Wait a bit and than check that results for all nodes are the same
-    time.sleep(1)
+    time.sleep(3)
     for key in keys:
         golden = None
         for node in nodes:
@@ -69,7 +69,8 @@ def test_node_crashing():
     print("Test passed!")
 
 
-def interactive_test(random_delay: bool = True):
+# DEBUG
+def interactive_mode(random_delay: bool = True):
     node_count = 3
     nodes = [Node(id = i, node_count=node_count, random_delay=random_delay)
              for i in range(node_count)]
@@ -104,4 +105,3 @@ def interactive_test(random_delay: bool = True):
 if __name__ == "__main__":
     # test_random_delays()
     test_node_crashing()
-    # interactive_test()

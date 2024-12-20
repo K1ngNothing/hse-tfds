@@ -78,8 +78,6 @@ class Node:
         '''
         while True:
             message = self.zmq_socket.recv_json()
-            if self.id == 0:
-                print(f"Node 0 got message {message}")
 
             if message[MESSAGE_TYPE] == CLIENT_REQUEST:
                 if self.check_and_mark_as_received(message):
@@ -101,8 +99,8 @@ class Node:
             sender_id: int = message[SENDER_ID]
             if sender_id != self.id:
                 # Update our clock
-                self.clock[self.id] += 1
                 self.clock = vector_clock.merge(self.clock, message[TIMESTAMP])
+                self.clock[self.id] += 1
 
             # Process operations
             for operation in message[OPERATIONS]:
